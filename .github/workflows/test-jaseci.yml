@@ -402,8 +402,8 @@ jobs:
 
     - name: Run E2E tests
       env:
-          SERVER_URL: http://localhost:8000
-      run: pytest jac-gpt-fullstack/tests/test_e2e.jac -v
+        SERVER_URL: http://localhost:8000
+      run: pytest jac-gpt/tests/test_e2e.jac -v
 
     - name: Stop jac-gpt server
       if: always()
