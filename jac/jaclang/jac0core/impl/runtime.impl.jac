@@ -106,7 +106,11 @@ impl JacAccessValidation.check_access_level(
         return AccessLevel.WRITE;
     }
     jctx = JacRuntimeInterface.get_context();
-    jroot = jctx.user_root;
+    _jroot = jctx.user_root;
+    if (_jroot is None) {
+        return AccessLevel.NO_ACCESS;
+    }
+    jroot: NodeAnchor = _jroot;
     if ((jroot == jctx.system_root) or (jroot.id == `to.root) or (jroot == `to)) {
         return AccessLevel.WRITE;
     }
@@ -254,7 +258,6 @@ impl JacNode.remove_edge(nd: NodeAnchor, `edge: EdgeAnchor) -> None {
     for (idx, ed) in enumerate(nd.edges) {
         if (ed.id == `edge.id) {
             nd.edges.pop(idx);
-            nd.is_updated = True;
             break;
         }
     }
@@ -288,7 +291,9 @@ impl JacWalker.`visit(
         next = [];
         for anchor in (i.__jac__ for i in expr)
             if isinstance(expr, `list)
-            else [expr.__jac__] {
+            else [expr.__jac__]
+                if isinstance(expr, (NodeArchetype, EdgeArchetype))
+                else [] {
             if (anchor not in wanch.ignores) {
                 if isinstance(anchor, (NodeAnchor, EdgeAnchor)) {
                     next.append(anchor);
@@ -890,8 +895,15 @@ impl JacCmd.create_cmd -> None { }
 """Set Class References."""
 impl JacBasics.setup -> None { }
 
-"""Get current execution context."""
+"""Get current execution context (request-scoped if available, else global)."""
 impl JacBasics.get_context -> ExecutionContext {
+    # Try request-scoped context first (for web servers)
+    ctx = _request_context.get();
+    if ctx is not None {
+        return ctx;
+    }
+
+    # Fallback to global context (CLI, tests, non-web environments)
     if (JacRuntime.exec_ctx is None) {
         JacRuntime.exec_ctx = JacRuntimeInterface.create_j_context(user_root=None);
     }
@@ -937,7 +949,6 @@ impl JacBasics.reset_graph(root: (Root | None) = None) -> int {
         for e in ranchor.edges
         if (e.id not in deleted_ids)
     ];
-    ranchor.is_updated = True;
     mem.commit(ranchor);
     return deleted_count;
 }
@@ -1137,7 +1148,17 @@ impl JacBasics.jac_import(
                 module.__path__ = spec.submodule_search_locations;
             }
             JacRuntimeInterface.load_module('__main__', module);
-            if spec.loader {
+            # Route .py files through Jac's compiler pipeline
+            if (spec.origin and spec.origin.endswith('.py')) {
+                codeobj = JacRuntime.get_compiler().get_bytecode(
+                    full_target=spec.origin, target_program=JacRuntime.get_program()
+                );
+                if codeobj {
+                    exec(codeobj, module.__dict__);
+                } elif spec.loader {
+                    spec.loader.exec_module(module);
+                }
+            } elif spec.loader {
                 spec.loader.exec_module(module);
             }
         } elif (reload_module and (module_name in sys.modules)) {
@@ -1525,8 +1546,6 @@ impl JacBasics.build_edge(
         );
         source.edges.append(eanch);
         target.edges.append(eanch);
-        source.is_updated = True;
-        target.is_updated = True;
         if conn_assign {
             for (fld, val) in zip(conn_assign[0], conn_assign[1], strict=False) {
                 if hasattr(`edge, fld) {
@@ -2370,4 +2389,18 @@ impl JacRuntime.set_base_path(base_path: (str | None)) -> None {
 """Set the context for the machine."""
 impl JacRuntime.set_context(context: ExecutionContext) -> None {
     JacRuntime.exec_ctx = context;
+}
+
+"""Set request-scoped execution context (for web servers)."""
+impl JacRuntime.set_request_context(context: ExecutionContext) -> None {
+    _request_context.set(context);
+}
+
+"""Clear request-scoped context and commit changes."""
+impl JacRuntime.clear_request_context -> None {
+    ctx = _request_context.get();
+    if ctx is not None {
+        ctx.close();
+        _request_context.set(None);
+    }
 }
