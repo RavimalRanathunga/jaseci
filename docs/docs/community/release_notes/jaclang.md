@@ -4,6 +4,7 @@ This document provides a summary of new features, improvements, and bug fixes in
 
 ## jaclang 0.13.6 (Unreleased)
 
+- **Fix: ES Codegen `new` Expression for `Any`-Typed Callees**: Calling a variable typed as `Any` no longer emits `new handler(payload)` in the generated JavaScript.
 - **Fix: Python-Compatible Scoping for Assignments in Non-Scoping Blocks**: Unannotated assignments inside `try`/`except`/`finally`, `if`/`else`, `for`/`while`, and `match` blocks now bind in the nearest enclosing Python scope instead of creating a shadow symbol in the block's faux scope. This eliminates spurious `W2003` "defined but never used" warnings when the same name is assigned across sibling branches (e.g., `category` in `try { ... } except { ... }`), and also fully resolves the former "string slice loses type" type-checker root cause: `while chomp.startswith('.') { chomp = chomp[1:]; ... }` no longer degrades `str` to `Unknown` because the re-assignment updates the single outer symbol instead of forking a branch-local one. Mirrors the existing walrus (`:=`) handling and matches Python semantics exactly.
 
 ## jaclang 0.13.5 (Latest Release)
