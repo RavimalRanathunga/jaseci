@@ -502,6 +502,22 @@ impl TypeEvaluator._get_type_of_expression_core(
 
         case uni.JsxElement():
             if self.prefetch and self.prefetch.jsx_element_class {
+                if expr.name and expr.name.parts {
+                    for part in expr.name.parts {
+                        if isinstance(part, uni.Name) {
+                            tag_val = part.value or "";
+                            if tag_val and tag_val[0].isupper() {
+                                # Uppercase = user component — resolve via normal scope.
+                                self.get_type_of_expression(part);
+                            } else {
+                                # Lowercase = intrinsic HTML element — resolve via
+                                # _JsxIntrinsicElements registry (JSX-context only,
+                                # not global scope).
+                                self._resolve_intrinsic_jsx_tag(part, tag_val);
+                            }
+                        }
+                    }
+                }
                 self._validate_jsx_props(expr, expected_type);
                 return self._convert_to_instance(self.prefetch.jsx_element_class);
             }
@@ -548,6 +564,14 @@ impl TypeEvaluator._get_type_of_expression_core(
                 # Member lookup on (narrowed) base type
                 assert isinstance(expr.right, uni.Name);
                 if isinstance(base_type, types.ModuleType) {
+                    # Foreign-source modules (JS/TS/asset/etc.) are opaque
+                    # to the Jac type system; any attribute access yields
+                    # gradual Any rather than looking up a symbol table
+                    # that doesn't (and can't) exist.
+                    if base_type.is_external {
+                        expr.right.type = types.AnyType();
+                        return expr.right.type;
+                    }
                     # getTypeOfMemberAccessWithBaseType()
                     if sym := type_utils.lookup_symtab(
                         base_type.symbol_table, expr.right.value, self.builtins_module
@@ -959,6 +983,14 @@ impl TypeEvaluator._get_type_of_expression_core(
                     return types.UnknownType();
                 } elif isinstance(base_type, types.TypeVarType) {
                     attr_name = expr.right.value;
+                    # ParamSpec.args / ParamSpec.kwargs -- the only attributes
+                    # a ParamSpec exposes (used in `*args: _P.args, **kwargs:
+                    # _P.kwargs` signatures). Full ParamSpecArgs/Kwargs
+                    # modelling is future work; returning AnyType is gradually
+                    # safe and silences bogus E1031 on typeshed stubs.
+                    if base_type.is_param_spec and attr_name in ("args", "kwargs") {
+                        return types.AnyType();
+                    }
                     # Constrained TypeVar - check all constraint types
                     if base_type.constraints {
                         found_member: Any = None;
@@ -2420,34 +2452,59 @@ impl TypeEvaluator.is_any_type(ty: TypeBase) -> bool {
     return False;
 }
 
+"""Match a typing special form loaded from any stdlib typing stub.
+
+Prefetch pins a single definition (e.g. typing.ParamSpec) but typeshed's
+typing_extensions.pyi declares its own ParamSpec/TypeVar/TypeVarTuple
+classes. Python unifies them at runtime; we match by canonical name
+constrained to stdlib stubs so user classes can't collide.
+"""
+impl TypeEvaluator._is_typing_special_form(ty: TypeBase, name: str) -> bool {
+    return (
+        isinstance(ty, types.ClassType)
+        and ty.shared is not None
+        and ty.shared.class_name == name
+        and ty.shared.is_from_stdlib_stub
+    );
+}
+
 """Check if a type is the TypeVar class itself (not a TypeVarType instance)."""
 impl TypeEvaluator.is_typevar_class(ty: TypeBase) -> bool {
-    return (
+    if (
         self.prefetch
         and self.prefetch.type_var_class
         and isinstance(ty, types.ClassType)
         and ty.shared == self.prefetch.type_var_class.shared
-    );
+    ) {
+        return True;
+    }
+    return self._is_typing_special_form(ty, "TypeVar");
 }
 
 """Check if a type is the ParamSpec class itself (not a TypeVarType instance)."""
 impl TypeEvaluator.is_paramspec_class(ty: TypeBase) -> bool {
-    return (
+    if (
         self.prefetch
         and self.prefetch.param_spec_class
         and isinstance(ty, types.ClassType)
         and ty.shared == self.prefetch.param_spec_class.shared
-    );
+    ) {
+        return True;
+    }
+    return self._is_typing_special_form(ty, "ParamSpec");
 }
 
 """Check if a type is the TypeVarTuple class itself (not a TypeVarType instance)."""
 impl TypeEvaluator.is_type_var_tuple_class(ty: TypeBase) -> bool {
-    return (
+    if (
         self.prefetch
         and self.prefetch.type_var_tuple_class
         and isinstance(ty, types.ClassType)
         and ty.shared == self.prefetch.type_var_tuple_class.shared
-    );
+    ) {
+        return True;
+    }
+    return self._is_typing_special_form(ty, "TypeVarTuple");
 }
 
 """Assign the source type to the destination type."""
@@ -2882,6 +2939,9 @@ impl TypeEvaluator._prefetch_types{
     self.prefetch.walker_class = get_jac_builtin_class("Walker");
     self.prefetch.jsx_element_class = get_jac_builtin_class("JsxElement");
     self.prefetch.html_common_props_class = get_jac_builtin_class("_HtmlCommonProps");
+    self.prefetch.jsx_intrinsic_elements_class = get_jac_builtin_class(
+        "_JsxIntrinsicElements"
+    );
     # Fixed-width numeric types
     self.prefetch.i8_class = get_jac_builtin_class("i8");
     self.prefetch.u8_class = get_jac_builtin_class("u8");
@@ -3339,22 +3399,33 @@ impl TypeEvaluator._get_type_from_flow_node(
 
 """Classify a CFG edge from an IfStmt predecessor to a successor as true/false."""
 impl TypeEvaluator._classify_edge(pred: uni.IfStmt, succ: uni.UniCFGNode) -> str {
-    # True branch: succ is the first statement in pred.body.
+    # Direct entry into the true branch.
     if pred.body and succ is pred.body[0] {
         return "true";
     }
-    # False branch: ElseIf (which IS a CodeBlockStmt/UniCFGNode).
+    # Direct entry into the false branch.
     if isinstance(pred.else_body, uni.ElseIf) and succ is pred.else_body {
         return "false";
     }
-    # False branch: ElseStmt (NOT a CFG node) -- edge goes to its body[0].
-    if isinstance(pred.else_body, uni.ElseStmt) {
-        if pred.else_body.body and succ is pred.else_body.body[0] {
-            return "false";
-        }
+    if isinstance(pred.else_body, uni.ElseStmt)
+    and pred.else_body.body
+    and succ is pred.else_body.body[0] {
+        return "false";
     }
-    # False branch: no else_body (fall-through to next sibling).
-    if pred.else_body is None and succ not in pred.body {
+    # Fall-through to next sibling: which branch is the empty one?
+    body_empty = not pred.body;
+    else_empty = isinstance(pred.else_body, uni.ElseStmt) and not pred.else_body.body;
+    has_else_branch = pred.else_body is not None;
+    if body_empty and (else_empty or not has_else_branch) {
+        # Both paths fall through -- no narrowing.
+        return "unconditional";
+    }
+    if body_empty {
+        # Only the true branch is empty; fall-through is the true path.
+        return "true";
+    }
+    if else_empty or not has_else_branch {
+        # False branch is empty or absent; fall-through is the false path.
         return "false";
     }
     return "unconditional";
