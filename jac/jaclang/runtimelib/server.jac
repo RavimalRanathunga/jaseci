@@ -1,5 +1,6 @@
 """REST API Server for Jac Programs."""
 import asyncio;
+import dataclasses;
 import hashlib;
 import html;
 import inspect;
@@ -12,9 +13,9 @@ import from http.server { BaseHTTPRequestHandler, HTTPServer }
 import from inspect { iscoroutine, isgenerator }
 import from pathlib { Path }
 import from typing {
-    TYPE_CHECKING,
     Any,
     AsyncGenerator,
+    Generator,
     Literal,
     TypeAlias,
     get_type_hints
@@ -33,12 +34,7 @@ import from jaclang { JacRuntime as Jac }
 import from jaclang.project.config { get_config }
 import from jaclang.runtimelib.scheduler { Scheduler }
 import from jaclang.jac0core.constant { Constants as Con }
-
-with entry {
-    if TYPE_CHECKING {
-        import from jaclang.jac0core.constructs { Archetype, WalkerArchetype }
-    }
-}
+import type from jaclang.jac0core.constructs { Archetype, WalkerArchetype }
 
 glob JsonValue: TypeAlias = None | str | int | float | bool | list['JsonValue'] | dict[
          (str, 'JsonValue')
@@ -117,32 +113,32 @@ obj ExecutionManager {
 
     async def execute_function(
         func: Callable[(..., Any)], args: dict[(str, Any)], username: str
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
     async def execute_function_sync(
         func: Callable[(..., Any)], args: dict[(str, Any)], username: str
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
     async def execute_function_async(
         func: Callable[(..., Any)], args: dict[(str, Any)], username: str
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
     async def spawn_walker(
         walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
     async def spawn_walker_sync(
         walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
     async def spawn_walker_async(
         walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 
     async def report_collector(call_state: CallState) -> dict[str, JsonValue];
     async def _finalize_call_response(
         call_state: CallState, result: Any
-    ) -> dict[str, JsonValue];
+    ) -> dict[str, JsonValue] | Generator | AsyncGenerator;
 }
 
 """Introspects and caches module metadata."""
