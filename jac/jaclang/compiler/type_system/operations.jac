@@ -43,7 +43,15 @@ glob BINARY_OPERATOR_MAP: dict[str, tuple[str, str]] = {
          Tok.GT: ('__gt__', '__lt__'),
          Tok.GTE: ('__ge__', '__le__')
      },
-     ARITHMETIC_OPERATORS: set[str] = {Tok.PLUS,Tok.MINUS,Tok.STAR_MUL,Tok.DIV,Tok.FLOOR_DIV,Tok.MOD,Tok.STAR_POW},
+     ARITHMETIC_OPERATORS: set[str] = {
+         Tok.PLUS,
+         Tok.MINUS,
+         Tok.STAR_MUL,
+         Tok.DIV,
+         Tok.FLOOR_DIV,
+         Tok.MOD,
+         Tok.STAR_POW
+     },
      INT_LIKE_WIDTHS: dict[str, int] = {
          "i8": 8,
          "u8": 8,
@@ -54,7 +62,7 @@ glob BINARY_OPERATOR_MAP: dict[str, tuple[str, str]] = {
          "i64": 64,
          "u64": 64
      },
-     FLOAT_LIKE_NAMES: set[str] = {"f32","f64"},
+     FLOAT_LIKE_NAMES: set[str] = {"f32", "f64"},
      AUG_OPERATOR_MAP: dict[str, str] = {
          Tok.ADD_EQ: '__iadd__',
          Tok.SUB_EQ: '__isub__',
@@ -621,6 +629,29 @@ def get_type_of_binary_operation(
             expr.left.type = right_type;
         }
         return right_type;
+    }
+    # Pipe operators desugar to a call; argument-side tuple is unpacked.
+    if isinstance(expr.op, uni.Token)
+    and expr.op.name in [
+        Tok.PIPE_FWD,
+        Tok.A_PIPE_FWD,
+        Tok.PIPE_BKWD,
+        Tok.A_PIPE_BKWD
+    ] {
+        is_forward = expr.op.name in [Tok.PIPE_FWD, Tok.A_PIPE_FWD];
+        callable_node = expr.right if is_forward else expr.left;
+        arg_node = expr.left if is_forward else expr.right;
+        params: list[uni.Expr | uni.KWPair] = (
+            `list(arg_node.values)
+                if (isinstance(arg_node, uni.TupleVal) and arg_node.values)
+                else [arg_node]
+        );
+        # synthesize a FuncCall but its never attached to the AST;
+        synth_call = uni.FuncCall(
+            target=callable_node, params=params, genai_call=None, kid=expr.kid
+        );
+        synth_call.parent = expr.parent;
+        return evaluator.validate_call_args(synth_call);
     }
     return jtypes.UnknownType();
 }

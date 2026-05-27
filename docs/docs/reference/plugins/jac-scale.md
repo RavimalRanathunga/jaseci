@@ -46,6 +46,7 @@ jac plugins enable scale
 |-------|-------------|-----------------|
 | _(core)_ | FastAPI, uvicorn, JWT auth, CLI | Always included |
 | `[data]` | pymongo, redis | Using MongoDB/Redis for storage (`jac start` with database config) |
+| `[aws]` | boto3 | Using S3-compatible cloud storage |
 | `[monitoring]` | prometheus-client | Prometheus `/metrics` endpoint |
 | `[scheduler]` | apscheduler | `@schedule(trigger=...)` on walkers/functions |
 | `[deploy]` | kubernetes, docker | `jac start --scale` or `jac start --build` |
@@ -123,10 +124,13 @@ jac db recover-all --app app.jac
 [plugins.scale.server]
 port = 8000
 host = "0.0.0.0"
-docs_enabled = true   # Enable /docs, /redoc, /openapi.json (default: true)
+docs_enabled = true                  # Enable /docs, /redoc, /openapi.json (default: true)
+suppress_health_check_logs = false   # Suppress health-check access log entries (default: false)
 ```
 
 Set `docs_enabled = false` to disable Swagger UI, ReDoc, and the OpenAPI JSON endpoint in production.
+
+Set `suppress_health_check_logs = true` to suppress access log entries for health-check and documentation endpoints (`/`, `/docs`, `/openapi.json`, `/health`, `/healthz`, `/healthz/ready`, `/healthz/live`) from CLI output and Kubernetes pod logs. Useful for reducing log noise in production.
 
 ### CORS Configuration
 
@@ -784,6 +788,159 @@ The response strips internal fields (`credentials`, `password_hash`, `value_norm
 
 Returns `401 UNAUTHORIZED` for a missing or expired token, `404 NOT_FOUND` if the user has been deleted but the token is still valid.
 
+### Identity Management & Password Reset
+
+In addition to the static identities supplied at registration, users can attach more identities (e.g. add an email to a username-registered account), verify them via emailed links, and reset their password through a single-use token. All four endpoints share the same `Emailer` plug-in (see [Emailer](#emailer)); if no emailer is configured, identity additions still work for non-email types and password reset is disabled.
+
+**Tokens are:**
+
+- **Random** 32-byte URL-safe strings issued per request.
+- **SHA256-hashed at rest** so the raw token never lives in the database.
+- **Single-use**: consumed on first successful redeem, all other outstanding reset tokens for the same user are revoked on a successful password reset.
+- **TTL-bounded**: defaults are 24h for verify, 30min for reset; both configurable.
+- Stored in MongoDB with a TTL index when MongoDB is configured, in-process otherwise.
+
+Configure TTLs and the URLs the emails should point at:
+
+```toml
+[plugins.scale.auth]
+verify_token_ttl_seconds = 86400    # 24h
+reset_token_ttl_seconds  = 1800     # 30min
+verify_url_template      = "https://app.example.com/verify?token={token}"
+reset_url_template       = "https://app.example.com/reset?token={token}"
+```
+
+The `{token}` placeholder in each template is replaced with the raw token before the email is sent. Leave a template empty to receive the bare token in the email body (useful in tests/dev).
+
+#### Add Identity
+
+Attach a new identity to the authenticated user. **This endpoint never sends mail** -- it just adds the identity (email identities are stored as `verified=false`). To dispatch a verification email afterwards, call `/user/send-verification`.
+
+```bash
+curl -X POST http://localhost:8000/user/add-identity \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "identity": {"type": "email", "value": "alice@example.com"},
+    "is_recovery": true
+  }'
+```
+
+Returns HTTP 200:
+
+```json
+{
+  "ok": true,
+  "data": {"status": "added", "verified": false},
+  "meta": {"extra": {"http_status": 200}}
+}
+```
+
+Errors: `401 UNAUTHORIZED`, `409 IDENTITY_TAKEN`, `404 NOT_FOUND`.
+
+#### Send Verification
+
+Issue a verification token for an email identity on the authenticated user and deliver it via the configured emailer. Idempotent: returns `already_verified` if the identity is already verified. Calling it again on an unverified identity revokes prior outstanding verification tokens for the user and issues a fresh one (clean retry/resend).
+
+```bash
+curl -X POST http://localhost:8000/user/send-verification \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"identity": {"type": "email", "value": "alice@example.com"}}'
+```
+
+Returns HTTP 202 (email queued):
+
+```json
+{
+  "ok": true,
+  "data": {"status": "pending_verification", "email_sent": true},
+  "meta": {"extra": {"http_status": 202}}
+}
+```
+
+Returns HTTP 200 when the identity is already verified:
+
+```json
+{
+  "ok": true,
+  "data": {"status": "already_verified"},
+  "meta": {"extra": {"http_status": 200}}
+}
+```
+
+Errors: `400 VALIDATION_ERROR` (non-email identity or missing value), `401 UNAUTHORIZED`, `404 NOT_FOUND` (identity is not on the current user), `503 EMAIL_DISABLED` (no emailer configured).
+
+#### Verify Identity
+
+Consume the verification token delivered in the email. No Bearer token required; the verification token _is_ the credential.
+
+```bash
+curl -X POST http://localhost:8000/user/verify-identity \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<verification-token-from-email>"}'
+```
+
+Returns HTTP 200:
+
+```json
+{
+  "ok": true,
+  "data": {"status": "verified", "identity": "alice@example.com"},
+  "meta": {"extra": {"http_status": 200}}
+}
+```
+
+Errors: `400 INVALID_TOKEN` (expired, already-consumed, or unknown).
+
+#### Forgot Password
+
+Issue a one-time reset token to the user's verified recovery email. **Always returns HTTP 200** regardless of whether the account exists, to avoid leaking account existence to a probing attacker.
+
+```bash
+curl -X POST http://localhost:8000/user/forgot-password \
+  -H "Content-Type: application/json" \
+  -d '{"identity": {"type": "email", "value": "alice@example.com"}}'
+```
+
+Always returns:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "status": "ok",
+    "message": "If that account exists, a reset link has been sent."
+  },
+  "meta": {"extra": {"http_status": 200}}
+}
+```
+
+#### Reset Password
+
+Consume the reset token (delivered to the recovery email) and set a new password. Other outstanding reset tokens for the same user are revoked on success.
+
+```bash
+curl -X POST http://localhost:8000/user/reset-password \
+  -H "Content-Type: application/json" \
+  -d '{
+    "token": "<reset-token-from-email>",
+    "new_password": "newSecret123"
+  }'
+```
+
+Returns HTTP 200:
+
+```json
+{
+  "ok": true,
+  "data": {"status": "password_reset"},
+  "meta": {"extra": {"http_status": 200}}
+}
+```
+
+Errors: `400 INVALID_TOKEN`.
+
 ### Auth Endpoint Summary
 
 | Method | Path | Auth Required | Description |
@@ -793,11 +950,218 @@ Returns `401 UNAUTHORIZED` for a missing or expired token, `404 NOT_FOUND` if th
 | POST | `/user/refresh-token` | No (token in body) | Refresh an existing JWT |
 | GET | `/user/me` | Yes (Bearer) | Get the authenticated user's profile |
 | PUT | `/user/password` | Yes (Bearer) | Update password |
+| POST | `/user/add-identity` | Yes (Bearer) | Attach an email/username identity to the current user (no email sent) |
+| POST | `/user/send-verification` | Yes (Bearer) | Dispatch a verification email for an unverified email identity |
+| POST | `/user/verify-identity` | No (token in body) | Confirm an email identity via the token sent by email |
+| POST | `/user/forgot-password` | No | Start the password-reset flow (always returns 200) |
+| POST | `/user/reset-password` | No (token in body) | Consume a reset token and set a new password |
 | GET | `/sso/{platform}/{operation}` | No | Initiate SSO flow |
 | GET/POST | `/sso/{platform}/callback` | No | SSO callback handler |
 | POST | `/api-key/create` | Yes (Bearer) | Create an API key |
 | GET | `/api-key/list` | Yes (Bearer) | List API keys |
 | DELETE | `/api-key/{api_key_id}` | Yes (Bearer) | Revoke an API key |
+
+---
+
+## Emailer
+
+jac-scale's `Emailer` is a thin abstraction (`jac_scale.abstractions.emailer.Emailer`) used by the framework to send verification and password-reset emails. It ships with a built-in SMTP implementation and accepts any user-supplied subclass via `jac.toml` -- no jac-scale code changes required.
+
+### Configuration
+
+```toml
+[plugins.scale.emailer]
+provider     = "smtp"                   # 'smtp', a registered short name, or 'pkg.module:ClassName'
+from_address = "no-reply@example.com"
+enabled      = true                     # set false to disable email features without removing config
+```
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `provider` | Resolution token. `"smtp"` selects the built-in SMTPEmailer, any other registered short name selects a class registered via `emailer_factory.register()`, and `"pkg.module:ClassName"` is dynamically imported. Empty means email is disabled. | `""` (disabled) |
+| `from_address` | Default `From:` address used when a handler doesn't override `from_addr`. | `""` |
+| `enabled` | Soft kill-switch; the framework treats the emailer as disabled when `false`. | `true` |
+
+### Resolution Order
+
+The factory resolves `provider` in this order:
+
+1. `"smtp"` → built-in `SMTPEmailer` (uses the `[plugins.scale.emailer.smtp]` table).
+2. A name registered programmatically via `emailer_factory.register(name, cls)`.
+3. A `"pkg.module:ClassName"` (or fallback `"pkg.module.ClassName"`) string is imported via `importlib`, validated as a subclass of `Emailer`, and instantiated with the resolved config dict.
+
+If `provider` is empty or import/validation fails, the factory returns `None` and the framework logs that email features are disabled.
+
+### Built-in SMTP
+
+```toml
+[plugins.scale.emailer]
+provider     = "smtp"
+from_address = "no-reply@example.com"
+
+[plugins.scale.emailer.smtp]
+host     = "smtp.example.com"
+port     = 587
+username = "apikey"
+# password = "..."          # or set EMAILER_SMTP_PASSWORD env var (preferred)
+use_tls  = true
+timeout  = 10.0
+```
+
+| SMTP key | Description | Default |
+|----------|-------------|---------|
+| `host` | SMTP server hostname | `localhost` |
+| `port` | SMTP port | `25` |
+| `username` | SMTP auth username | `""` |
+| `password` | SMTP auth password. **Prefer the `EMAILER_SMTP_PASSWORD` env var.** | `""` |
+| `use_tls` | STARTTLS upgrade after connect | `true` |
+| `timeout` | Connection timeout in seconds | `10.0` |
+
+### Custom Emailer (Python or Jac)
+
+Subclass `Emailer` and point `provider` at your class. The factory imports it dynamically at server startup and instantiates it with the full emailer config dict.
+
+```python
+# myapp/email.py
+from jac_scale.abstractions.emailer import Emailer
+import os, sendgrid
+
+class SendGridEmailer(Emailer):
+    def postinit(self):
+        self._client = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+
+    def send_email(self, to_addr, subject, body_text, body_html=None, from_addr=None):
+        # ... use self._client to send ...
+        return True
+
+    def is_ready(self):
+        return self.enabled and self._client is not None
+```
+
+```toml
+[plugins.scale.emailer]
+provider     = "myapp.email:SendGridEmailer"
+from_address = "no-reply@example.com"
+```
+
+The constructor receives the resolved config dict, so any extra TOML keys you put under `[plugins.scale.emailer.<your_section>]` are available via `self.config`. Keep secrets (API keys, passwords) in environment variables -- the constructor can read `os.environ` directly.
+
+### Examples
+
+#### Example 1 -- Built-in SMTP (default emailer)
+
+Use this when you have an SMTP relay already (Gmail, AWS SES SMTP interface, your own postfix, etc.). No custom code required.
+
+```toml
+# jac.toml
+[plugins.scale.emailer]
+provider     = "smtp"
+from_address = "no-reply@example.com"
+
+[plugins.scale.emailer.smtp]
+host     = "smtp.gmail.com"
+port     = 587
+username = "no-reply@example.com"
+use_tls  = true
+
+[plugins.scale.auth]
+verify_token_ttl_seconds = 86400
+reset_token_ttl_seconds  = 1800
+verify_url_template      = "https://app.example.com/verify?token={token}"
+reset_url_template       = "https://app.example.com/reset?token={token}"
+```
+
+Export the password before starting the server:
+
+```bash
+export EMAILER_SMTP_PASSWORD="<app-password>"
+jac start
+```
+
+Test the flow end to end:
+
+```bash
+# 1) Register
+curl -X POST http://localhost:8000/user/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "identities": [{"type": "email", "value": "alice@example.com"}],
+    "credential": {"type": "password", "password": "secret"}
+  }'
+
+# 2) Trigger forgot-password (always returns 200)
+curl -X POST http://localhost:8000/user/forgot-password \
+  -H "Content-Type: application/json" \
+  -d '{"identity": {"type": "email", "value": "alice@example.com"}}'
+
+# 3) Click the link in the email; the frontend pulls the token out of the
+#    URL and posts it back:
+curl -X POST http://localhost:8000/user/reset-password \
+  -H "Content-Type: application/json" \
+  -d '{"token": "<token-from-email>", "new_password": "brandNew123"}'
+```
+
+#### Example 2 -- Custom SendGrid emailer
+
+Use this when you want SendGrid's REST API instead of SMTP (better deliverability stats, templates, webhooks).
+
+```python
+# myapp/email.py
+from jac_scale.abstractions.emailer import Emailer
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+import os, logging
+
+logger = logging.getLogger(__name__)
+
+class SendGridEmailer(Emailer):
+    def postinit(self):
+        api_key = os.environ.get("SENDGRID_API_KEY", "")
+        self._client = SendGridAPIClient(api_key=api_key) if api_key else None
+
+    def send_email(self, to_addr, subject, body_text, body_html=None, from_addr=None):
+        if self._client is None:
+            logger.warning("SendGrid client not configured; dropping email to %s", to_addr)
+            return False
+        msg = Mail(
+            from_email=from_addr or self.from_address,
+            to_emails=to_addr,
+            subject=subject,
+            plain_text_content=body_text,
+            html_content=body_html,
+        )
+        try:
+            resp = self._client.send(msg)
+            return 200 <= resp.status_code < 300
+        except Exception as e:
+            logger.error("SendGrid send failed: %s", e)
+            return False
+
+    def is_ready(self):
+        return self.enabled and self._client is not None
+```
+
+```toml
+# jac.toml
+[plugins.scale.emailer]
+provider     = "myapp.email:SendGridEmailer"
+from_address = "no-reply@example.com"
+
+[plugins.scale.auth]
+verify_token_ttl_seconds = 86400
+reset_token_ttl_seconds  = 1800
+verify_url_template      = "https://app.example.com/verify?token={token}"
+reset_url_template       = "https://app.example.com/reset?token={token}"
+```
+
+Run:
+
+```bash
+export SENDGRID_API_KEY="SG.xxxxxxxx"
+jac start
+```
+
+Run `jac start` from the directory containing `myapp/` so the package is importable. The factory verifies `issubclass(SendGridEmailer, Emailer)` at startup; on a typo or wrong base class it logs an error and disables email (the server keeps running).
 
 ---
 
@@ -1471,6 +1835,7 @@ All storage instances provide these methods:
 | `get_metadata` | `get_metadata(path) -> dict` | Get file metadata (size, modified, created, is_dir, name) |
 | `copy` | `copy(source, destination) -> bool` | Copy a file within storage |
 | `move` | `move(source, destination) -> bool` | Move a file within storage |
+| `get_url` | `get_url(path, expires_in=3600) -> str` | Get a public or pre-signed URL for a file |
 
 ### Usage Example
 
@@ -1519,6 +1884,51 @@ walker :pub list_files {
         report {"files": files};
     }
 }
+```
+
+### S3-Compatible Cloud Storage
+
+`jac-scale` enables seamless integration with S3-compatible object storage. When configured, the `store()` builtin returns an `S3Storage` instance instead of the default local one.
+
+#### Configuration
+
+Storage is configured in `jac.toml` under the `[plugins.scale.storage]` section or via environment variables.
+
+| `jac.toml` key | Env Variable | Description | Default |
+|----------------|--------------|-------------|---------|
+| `type` | `JAC_STORAGE_TYPE` | Storage backend: `local` or `s3` | `local` |
+| `bucket` | `JAC_STORAGE_S3_BUCKET` | S3 bucket name | None |
+| `region` | `JAC_STORAGE_S3_REGION` | S3 region | `us-east-1` |
+| `prefix` | `JAC_STORAGE_S3_PREFIX` | Optional prefix (directory) for all keys | `""` |
+| `endpoint_url`| `JAC_STORAGE_S3_ENDPOINT_URL` | Custom endpoint for non-AWS providers | None |
+| `public_read` | `JAC_STORAGE_S3_PUBLIC_READ` | If `true`, returns direct public URLs | `false` |
+
+**Example `jac.toml`:**
+
+```toml
+[plugins.scale.storage]
+type = "s3"
+bucket = "my-app-uploads"
+region = "us-east-1"
+public_read = false
+```
+
+### Generating URLs
+
+The `get_url()` method provides a standardized way to expose files to the internet or internal services.
+
+- **LocalStorage**: Returns a `file://` URI to the absolute path of the file.
+- **S3Storage (Private)**: Returns a secure **pre-signed URL** that expires after the specified time (default: 1 hour).
+- **S3Storage (Public)**: If `public_read = true`, returns a direct, permanent public URL.
+
+```jac
+with entry {
+    storage = store();
+
+    # Generate a URL that expires in 10 minutes (600 seconds)
+    # For S3, this is a pre-signed URL.
+    url = storage.get_url("profile-photos/user1.jpg", expires_in=600);
+}
 
 walker :pub download_file {
     has path: str;
@@ -1540,14 +1950,14 @@ Configure storage in `jac.toml`:
 
 ```toml
 [storage]
-storage_type = "local"       # Storage backend type
-base_path = "./storage"      # Base directory for files
-create_dirs = true           # Auto-create directories
+type = "local"           # Storage backend type
+base_path = "./storage"  # Base directory for files
+create_dirs = true       # Auto-create directories
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `storage_type` | string | `"local"` | Storage backend (`local`) |
+| `type` | string | `"local"` | Storage backend (`local`, `s3`) |
 | `base_path` | string | `"./storage"` | Base path for file storage |
 | `create_dirs` | boolean | `true` | Automatically create directories |
 
@@ -1559,7 +1969,7 @@ create_dirs = true           # Auto-create directories
 | `JAC_STORAGE_PATH` | Base directory (overrides jac.toml) |
 | `JAC_STORAGE_CREATE_DIRS` | Auto-create directories (`"true"`/`"false"`) |
 
-Configuration priority: `jac.toml` > environment variables > defaults.
+Configuration priority: environment variables > `jac.toml` > defaults.
 
 ### StorageFactory (Advanced)
 
@@ -1797,6 +2207,129 @@ This is the right pattern for autosave debouncing, leader-only reconciliation cy
 | Leader election (one pod holds a long-lived role) | `set_nx_with_ttl` with renewing TTL | `delete_if_equals` on graceful shutdown |
 
 `set_nx_with_ttl` and `delete_if_equals` raise `NotImplementedError` on MongoDB; distributed-lock semantics require Redis.
+
+---
+
+## Event Streaming
+
+Optional event-streaming broker for emitting and consuming events between jac code and external systems. Off by default. Provides durable log, consumer groups, replayable offsets via `start_from`, and at-least-once delivery with retries and a DLQ.
+
+Two implementations ship in-tree:
+
+- **`LocalEventStream`** (in-memory): single-process, no persistence. Used automatically when no Redis URL is configured. Right for dev workstations, tests, and single-pod deployments.
+- **`RedisEventStream`** (Redis Streams): durable, cross-pod. Used automatically when a Redis URL resolves and the `[data]` extra is installed.
+
+You don't pick the broker; selection happens at startup based on what's available.
+
+### Enabling
+
+Add the section to `jac.toml`. Master switch is `enabled`; everything else has working defaults.
+
+```toml
+[plugins.scale.events]
+enabled = true
+# Optional. If unset, falls back to [plugins.scale.database].redis_url; if neither
+# resolves, the in-memory LocalEventStream is used.
+url = "redis://localhost:6379/0"
+consumer_group = "jac-scale"
+serializer = "json"
+
+[plugins.scale.events.retry]
+max_attempts = 3
+backoff_seconds = [1, 5, 30]
+dead_letter_suffix = ".dlq"
+```
+
+To use Redis Streams you need the `[data]` extra: `pip install jac-scale[data]`. Without it, jac-scale silently uses `LocalEventStream` and logs a warning at startup.
+
+### Publishing
+
+```jac
+import from jac_scale.events.publisher { publish }
+import from jac_scale.events.broker { Event }
+
+walker place_order {
+    has order_id: int;
+    has amount: float;
+
+    can fire with Root entry {
+        publish("orders.placed", Event(
+            data={"order_id": self.order_id, "amount": self.amount},
+            trace_id="trace-1"
+        ));
+    }
+}
+```
+
+`publish()` is fire-and-forget. Errors from the broker are logged and swallowed so emit sites do not have to wrap calls in try/except. `event.event_type` auto-defaults to the topic when left empty, so the topic string only needs to appear once at the call site (set `event_type` explicitly only when it differs from the topic).
+
+### Subscribing (push)
+
+```jac
+import from jac_scale.events.subscriber { subscribe }
+import from jac_scale.events.broker { Event }
+
+@subscribe("orders.placed")
+def on_order_placed(event: Event) -> None {
+    print(event.event_type, event.data);
+}
+```
+
+Handlers register at import time. At server startup, the framework walks the registry and wires each handler into the active broker. A daemon consumer thread is spawned per subscription.
+
+`@subscribe` accepts optional `group=` and `retry=` arguments to override the defaults from `jac.toml`, plus `start_from=` to control where a brand-new consumer group begins reading. Default is `"latest"` (only events produced after the group is created); pass `"earliest"` to replay everything still retained, or a broker-specific position token (e.g. a Redis stream id like `"1700000000000-0"`) to resume from a specific offset. `start_from` is a one-time bookmark: existing groups always resume from their stored position and ignore this argument.
+
+```jac
+@subscribe("orders.placed", start_from="earliest")
+def replay_all(event: Event) -> None {
+    print("replaying", event.id);
+}
+```
+
+### Consuming (pull)
+
+```jac
+import from jac_scale.events.broker { EventStreamBroker }
+
+def drain(broker: EventStreamBroker) -> int {
+    batch = broker.consume(
+        "orders.placed", max_messages=10, timeout_seconds=2.0
+    );
+    for ev in batch {
+        # ... process ev ...
+        broker.ack(ev);
+    }
+    return len(batch);
+}
+```
+
+`consume()` blocks for up to `timeout_seconds` waiting for at least one event, then returns whatever has arrived (up to `max_messages`). Each event must be acked individually via `ack(event)` or the broker will redeliver it after its visibility timeout. `consume()` accepts the same `start_from=` argument as `subscribe()`; it only affects the first call that creates the consumer group, subsequent calls resume from the stored position.
+
+### Configuration reference
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Master switch. When `false`, all event-streaming calls are no-ops. |
+| `url` | `null` | Redis URL. If unset, falls back to `[plugins.scale.database].redis_url`. If neither is set or the `redis` extra is missing, `LocalEventStream` (in-memory) is used. |
+| `consumer_group` | `jac-scale` | Default consumer group name when `@subscribe` does not specify one. |
+| `serializer` | `json` | Wire format. JSON only. |
+| `retry.max_attempts` | `3` | Number of delivery attempts before sending to the DLQ topic. |
+| `retry.backoff_seconds` | `[1, 5, 30]` | Backoff delays per attempt index, clamped to the last value. |
+| `retry.dead_letter_suffix` | `.dlq` | Suffix appended to a topic name to form its dead-letter topic. |
+
+### Reliability semantics
+
+- **At-least-once delivery.** Handlers may run more than once for the same event. Make handlers idempotent, or dedupe on `event.id`.
+- **Retry.** A failing handler is retried `retry.max_attempts` times with delays from `retry.backoff_seconds`. The thread sleeps responsively to the broker stop event so shutdowns are not blocked by long backoffs.
+- **Dead-letter topic.** After retry exhaustion, the event is published to `<topic><retry.dead_letter_suffix>` and the original is acked so it is not redelivered indefinitely. The DLQ is a regular topic you can `consume()` like any other.
+- **Drain on shutdown.** On process exit, consumer threads are signaled to stop and joined under a 10-second deadline.
+
+### Operational notes
+
+- Each subscription spawns one daemon thread named `jac-scale-broker-<topic>-<group>` (Redis) or `jac-scale-local-<topic>-<group>` (Local). Inspect via standard threading tools.
+- Delivery metadata is exposed as first-class fields on `Event`: `event.delivery_id`, `event.delivery_topic`, `event.delivery_group`. Handlers that need them for idempotency keys, structured logging, or dedup can read them directly without importing broker-specific constants. The fields are broker-managed: producers leave them `None`, the broker sets them on `consume()` / push delivery, and they are not serialized to the wire.
+- Startup logs `Events broker enabled (kind={local|redis}, subscriptions=N)` so it is easy to confirm wiring at a glance.
+- The wire format is CloudEvents 1.0 valid (`specversion`, `type`, `data`, `id`, `source`, `time`, plus `trace_id` and `headers` as extensions), so strict CE consumers (Argo Events, Knative Eventing, CE-aware Kafka tooling) accept it.
 
 ---
 
@@ -2700,6 +3233,116 @@ This eliminates the need for manual `kubectl create secret` commands after deplo
 
 ---
 
+## Remote Image Registry
+
+Remote Kubernetes clusters (EKS, GKE, AKS, etc.) pull images from a registry rather than loading them from a local container runtime. Set `image_registry` in `jac.toml` to push there before manifest apply:
+
+```toml
+[plugins.scale.kubernetes]
+image_registry = "${ECR_REGISTRY}"
+```
+
+Behavior:
+
+- **Local clusters** (Minikube, Docker Desktop, k3d, kind): if `image_registry` is unset, the built image is loaded directly into the cluster's runtime (`minikube image load`, `k3d image import`, `kind load docker-image`).
+- **Remote clusters**: `image_registry` must be set. The image is tagged as `<image_registry>/<app_name>:dev-<sha12>` and pushed before `kubectl apply`. The `<sha12>` suffix is a content hash of the source tree -- rebuilds change the tag, which triggers an automatic rolling update.
+- The registry value supports `${ENV_VAR}` interpolation so you can keep registry URLs out of source control. The local environment is read at deploy time.
+- Authentication to the registry is up to you (`docker login`, ECR `get-login-password`, GCR service account, etc.). `jac-scale` does not manage registry credentials.
+
+---
+
+## Pre-Bound ServiceAccount
+
+By default microservice + gateway pods run as the namespace's `default` ServiceAccount. Apps that need to call the Kubernetes API at runtime (creating/watching pods or namespaces, listing custom resources, etc.) need a ServiceAccount pre-bound with the right RBAC. Configure with `service_account_name`:
+
+```toml
+[plugins.scale.kubernetes]
+service_account_name = "myapp-sa"
+```
+
+`jac-scale` references the SA but does not create it. Both the SA itself and any RoleBindings or ClusterRoleBindings it needs must already exist in the target namespace before deploy -- typically managed by your platform layer (Helm chart, Terraform module, or `kubectl apply` of cluster-scoped policy). When the field is unset (or empty), pods fall back to the namespace's `default` SA.
+
+Once set, every microservice pod and the gateway pod runs under that SA, and any in-pod Kubernetes client (e.g. `kubernetes` Python package's `load_incluster_config()`) picks up the SA token automatically from `/var/run/secrets/kubernetes.io/serviceaccount/token`.
+
+---
+
+## Cross-Service Shared Volumes
+
+Microservice apps that share filesystem state across pods (an IDE backend that writes a project workspace and a build worker that reads it, a job queue that drops files for a worker pool) declare shared volumes in `jac.toml`:
+
+```toml
+[[plugins.scale.microservices.shared_volumes]]
+name = "workspace"
+mount_path = "/data/workspace"
+services = ["builder_sv", "build_worker"]
+size = "10Gi"
+access_mode = "ReadWriteMany"
+storage_class = "efs-sc"
+```
+
+Each entry is an [array of tables](https://toml.io/en/v1.0.0#array-of-tables) (note the double brackets); declare multiple by repeating the block.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | PVC name. Must be DNS-1123 (lowercase alphanumeric and `-`). |
+| `mount_path` | yes | Where the volume mounts inside each pod. |
+| `services` | yes | Module names from `[plugins.scale.microservices.routes]` that get this mount. The gateway can also be listed (use `__gateway__`) but rarely needs to. |
+| `size` | yes (PVC mode) | Requested storage, e.g. `10Gi`. |
+| `access_mode` | yes (PVC mode) | One of `ReadWriteMany` (most common for cross-pod), `ReadWriteOnce`, `ReadOnlyMany`. ReadWriteMany requires an RWX-capable storage class. |
+| `storage_class` | yes (PVC mode) | The StorageClass to bind to. Cloud providers' RWX classes: AWS `efs-sc`, GCP Filestore CSI, Azure Files. |
+| `host_path` | yes (hostPath mode) | Local-cluster-only alternative; binds the volume to a directory on the host node. Use only on k3d / kind / Minikube; will not survive a pod move on multi-node clusters. |
+
+PVC mode and hostPath mode are mutually exclusive per entry. K-track applies PVCs before Deployments so pods do not crash-loop on "PVC not found".
+
+> **EFS gotcha.** AWS EFS CSI access points enforce a POSIX UID on every file. The shipped microservice image sets `git config --system --add safe.directory '*'` so in-pod `git` commands against the shared volume do not trip CVE-2022-24765 dubious-ownership checks when the EFS UID differs from the pod's running UID. If you bake your own image, add the same line, or set a matching `securityContext` on the pod (`runAsUser` / `fsGroup` -- not yet exposed in `[plugins.scale.kubernetes]`, on the roadmap).
+
+---
+
+## Microservice Mode in Kubernetes
+
+When `[plugins.scale.microservices].enabled = true` and you run `jac start --scale` against a Kubernetes cluster, every entry in `[plugins.scale.microservices.routes]` becomes its own Deployment + Service + HPA + PodDisruptionBudget. The gateway runs as a separate pod that fronts every microservice via its routes prefix.
+
+### Auto-Injected Peer URLs
+
+Outside Kubernetes, sv-to-sv calls find peer providers via auto-spawn (single-process mode) or `JAC_SV_<MODULE>_URL` env vars (manual multi-host setup). Inside `--scale` Kubernetes mode, K-track auto-injects those env vars on every pod, derived from the routes table:
+
+```text
+JAC_SV_<PEER_MODULE>_URL=http://<peer>-service.<namespace>.svc.cluster.local:<container_port>
+```
+
+The env-var key uses the raw module name (the value to the right of `sv import from`) upper-cased and joined with `JAC_SV_…_URL`. The URL host uses the Kubernetes Service name with DNS-1123 normalization (so `jac_coder_sv` becomes `jac-coder-sv-service`). Self is skipped (no service points env at itself).
+
+You do not write these env vars by hand in `--scale` K8s mode; K-track derives them from `[plugins.scale.microservices.routes]` and the configured namespace.
+
+Per-service env overrides under `[plugins.scale.microservices.services.<name>.env]` cannot shadow these keys. A stale override would silently route sv-to-sv calls to a wrong backend, and the right way to point a peer at a non-cluster URL (e.g. a vendor SaaS) is to edit the Deployment env spec directly after deploy.
+
+### Per-Service Configuration
+
+Each microservice entry takes optional per-service overrides under `[plugins.scale.microservices.services.<name>]`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `replicas` | int | Initial replica count (default 1; HPA can scale higher). |
+| `rpc_timeout` | float (seconds) | Per-service sv-to-sv RPC timeout. Default 10s, fine for CRUD; bump to 120-300s for LLM workers. |
+| `image_tag` | str | Override the image tag for just this service (rare; most apps use the same image and select via `JAC_SV_NAME`). |
+| `env` | dict | Extra env vars merged into the pod spec. `JAC_SV_NAME` and `JAC_SV_*_URL` are protected (cannot be overridden). |
+| `hpa.enabled` | bool | Set to `false` to fix replicas at the configured `replicas` count. |
+| `hpa.min` / `hpa.max` | int | HPA replica bounds. |
+| `hpa.cpu_target` | int (percent) | Target CPU utilization for HPA. Default 70%. |
+
+```toml
+# Example: scale jac_coder_sv hot during LLM workloads, fix the gateway at 2.
+[plugins.scale.microservices.services.jac_coder_sv]
+rpc_timeout = 300.0
+hpa = { enabled = true, min = 2, max = 10, cpu_target = 60 }
+
+[plugins.scale.microservices.services.__gateway__]
+replicas = 2
+hpa = { enabled = false }
+```
+
+---
+
 ## Setting Up Kubernetes
 
 ### Docker Desktop (Easiest)
@@ -2882,7 +3525,7 @@ warm_pool_size = 0               # Pre-initialized pods for instant startup (K8s
 | `JAC_SANDBOX_NAMESPACE` | Kubernetes namespace |
 | `JAC_SANDBOX_DOMAIN` | Domain template |
 
-Configuration priority: `jac.toml` > environment variables > defaults.
+Configuration priority: environment variables > `jac.toml` > defaults.
 
 ---
 
